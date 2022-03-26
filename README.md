@@ -19,7 +19,7 @@ OPTIONS:
         --no-strip    Don't strip trailing newline from input
 ```
 
-## Exampleo
+## Examples
 
 Encode a string to binary
 
