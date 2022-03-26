@@ -1,7 +1,8 @@
-use std::io::{BufReader, Read, Stdin};
+use std::{io::{BufReader, Read, Stdin, Write}, str::Utf8Error};
 
 use anyhow::bail;
 use clap::Parser;
+use derive_more::Deref;
 
 const BYTE_SIZE: usize = 8;
 
@@ -12,10 +13,10 @@ struct Opts {
     decode: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deref, Eq, PartialEq)]
 struct BinMsg(Vec<u8>);
 
-#[derive(Debug)]
+#[derive(Clone, Debug, Deref, Eq, PartialEq)]
 struct StrMsg(String);
 
 impl BinMsg {
@@ -39,6 +40,10 @@ impl BinMsg {
         ).collect();
 
         Ok(BinMsg(bytes))
+    }
+
+    pub fn write(writer: &mut impl Write) -> anyhow::Result<()> {
+        todo!()
     }
 }
 
@@ -83,16 +88,19 @@ impl StrMsg {
     }
 }
 
-impl From<BinMsg> for StrMsg {
-    fn from(b: BinMsg) -> Self {
-        let mut s = String::new();
-        todo!()
+impl TryFrom<BinMsg> for StrMsg {
+    type Error = Utf8Error;
+
+    fn try_from(b: BinMsg) -> Result<Self, Self::Error> {
+        let s = std::str::from_utf8(&*b)?;
+        Ok(Self(s.to_owned()))
     }
 }
 
 impl From<StrMsg> for BinMsg {
     fn from(s: StrMsg) -> Self {
-        todo!()
+        let b = s.as_bytes();
+        Self(b.to_owned())
     }
 }
 
@@ -155,5 +163,17 @@ mod tests {
         let mut sbytes = s.as_bytes();
         let msg = BinMsg::read(&mut sbytes).unwrap();
         assert_eq!(msg.0, b)
+    }
+
+    #[test_case("01100001", "a")]
+    #[test_case("01100010", "b")]
+    #[test_case("0110000101100010", "ab")]
+    fn test_smsg_bmsg_conversion(mut b: &str, mut s: &str) {
+        let mut bbytes = b.as_bytes();
+        let mut sbytes = s.as_bytes();
+        let bmsg = BinMsg::read(&mut bbytes).unwrap();
+        let smsg = StrMsg::read(&mut sbytes).unwrap();
+        assert_eq!(bmsg, smsg.clone().into());
+        assert_eq!(bmsg.try_into(), Ok(smsg));
     }
 }
