@@ -1,4 +1,7 @@
-use std::{io::{BufReader, Read, Stdin, Write}, str::Utf8Error};
+use std::{
+    io::{Cursor, Read, Write},
+    str::Utf8Error,
+};
 
 use anyhow::bail;
 use clap::Parser;
@@ -11,6 +14,42 @@ struct Opts {
     /// Decode from digits to string
     #[clap(short = 'd')]
     decode: bool,
+
+    /// No trailing newline in output
+    #[clap(short = 'n')]
+    no_trailing_newline: bool,
+
+    /// Don't strip trailing newline from input
+    #[clap(long = "no-strip")]
+    no_strip: bool,
+}
+
+/// Read everything up front & trim newline from end
+struct TrimmedOneTimeReader(Cursor<Vec<u8>>);
+
+/// Remove trailing \n and \r from byte slice
+fn strip_trailing_whitespace(v: &mut Vec<u8>) {
+    let n = '\n' as u8;
+    let r = '\n' as u8;
+    while v.ends_with(&[n]) || v.ends_with(&[r]) {
+        v.pop();
+    }
+}
+
+impl TrimmedOneTimeReader {
+    pub fn try_new<R: Read>(mut reader: R) -> std::io::Result<Self> {
+        let mut buf = Vec::new();
+        reader.read_to_end(&mut buf)?;
+        strip_trailing_whitespace(&mut buf);
+        Ok(Self(Cursor::new(buf)))
+    }
+}
+
+impl Read for TrimmedOneTimeReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.0.read(buf)?;
+        Ok(n)
+    }
 }
 
 #[derive(Clone, Debug, Deref, Eq, PartialEq)]
@@ -20,7 +59,7 @@ struct BinMsg(Vec<u8>);
 struct StrMsg(String);
 
 impl BinMsg {
-    pub fn read(reader: &mut impl Read) -> anyhow::Result<BinMsg> {
+    pub fn read(mut reader: impl Read) -> anyhow::Result<BinMsg> {
         let mut strbuf = String::new();
         reader.read_to_string(&mut strbuf)?;
 
@@ -33,26 +72,30 @@ impl BinMsg {
             );
         }
 
-        let all_bits = chars_to_bits(strbuf.chars())?;
+        let all_bits = str_to_bits(&strbuf)?;
         let bit_arrs = bit_slice_to_arrays(&all_bits);
-        let bytes: Vec<u8> = bit_arrs.into_iter().map(|bits|
-            bits_to_byte(bits)
-        ).collect();
+        let bytes: Vec<u8> = bit_arrs
+            .into_iter()
+            .map(|bits| bits_to_byte(bits))
+            .collect();
 
         Ok(BinMsg(bytes))
     }
 
-    pub fn write(writer: &mut impl Write) -> anyhow::Result<()> {
-        todo!()
+    pub fn write(&self, mut writer: impl Write) -> anyhow::Result<()> {
+        // let s = self.iter().map(|x|);
+        // writer.write_all(self.as_bytes())?;
+        let bits: Vec<bool> = self.iter().flat_map(|&b| byte_to_bits(b)).collect();
+        let s = bits_to_str(&bits);
+        writer.write_all(s.as_bytes())?;
+
+        Ok(())
     }
 }
 
-fn chars_to_bits<I>(chars: I) -> anyhow::Result<Vec<bool>>
-where
-    I: Iterator<Item = char>,
-{
+fn str_to_bits(s: &str) -> anyhow::Result<Vec<bool>> {
     let mut binvec = Vec::new();
-    for c in chars {
+    for c in s.chars() {
         match c {
             '1' => binvec.push(true),
             '0' => binvec.push(false),
@@ -60,6 +103,12 @@ where
         }
     }
     Ok(binvec)
+}
+
+fn bits_to_str(bits: &[bool]) -> String {
+    bits.iter()
+        .map(|&bit| if bit { '1' } else { '0' })
+        .collect()
 }
 
 fn bit_slice_to_arrays(slice: &[bool]) -> Vec<[bool; BYTE_SIZE]> {
@@ -80,11 +129,27 @@ fn bits_to_byte(bits: [bool; 8]) -> u8 {
         .fold(0u8, |acc, (i, bit)| acc | ((bit as u8) << i))
 }
 
+fn byte_to_bits(byte: u8) -> [bool; BYTE_SIZE] {
+    let bits_iter = (0..BYTE_SIZE).rev().map(|i| byte & (1 << i) != 0);
+
+    let mut bits_arr = [false; BYTE_SIZE];
+    for (i, bit) in bits_iter.enumerate() {
+        bits_arr[i] = bit;
+    }
+
+    bits_arr
+}
+
 impl StrMsg {
-    pub fn read(reader: &mut impl Read) -> anyhow::Result<StrMsg> {
+    pub fn read(mut reader: impl Read) -> anyhow::Result<StrMsg> {
         let mut buf = String::new();
         reader.read_to_string(&mut buf)?;
         Ok(Self(buf))
+    }
+
+    pub fn write(&self, mut writer: impl Write) -> anyhow::Result<()> {
+        writer.write_all(self.as_bytes())?;
+        Ok(())
     }
 }
 
@@ -104,32 +169,64 @@ impl From<StrMsg> for BinMsg {
     }
 }
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let opts: Opts = Opts::parse();
 
-    let mut stdin = std::io::stdin();
+    let stdin = std::io::stdin();
+    let mut stdout = std::io::stdout();
 
-    // match opts.from {
-    //     Format::Raw => todo!(),
-    //     Format::Digits => todo!(),
-    //     Format::String => todo!(),
-    // }
+    let input: Box<dyn Read> = if opts.no_strip {
+        Box::new(stdin)
+    } else {
+        Box::new(TrimmedOneTimeReader::try_new(stdin)?)
+    };
+
+    if opts.decode {
+        decode(input, &mut stdout)?;
+    } else {
+        encode(input, &mut stdout)?;
+    }
+
+    if !opts.no_trailing_newline {
+        writeln!(stdout, "")?;
+    }
+
+    Ok(())
+}
+
+fn encode(reader: impl Read, writer: impl Write) -> anyhow::Result<()> {
+    let smsg = StrMsg::read(reader)?;
+    let bmsg: BinMsg = smsg.into();
+    bmsg.write(writer)?;
+
+    Ok(())
+}
+
+fn decode(reader: impl Read, writer: impl Write) -> anyhow::Result<()> {
+    let bmsg = BinMsg::read(reader)?;
+    let smsg: StrMsg = bmsg.try_into()?;
+    smsg.write(writer)?;
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
-
     use super::*;
     use test_case::test_case;
 
     #[test]
-    fn test_chars_to_bits() {
+    fn test_str_to_bits() {
         let s = "10010101";
-        let chars = s.chars();
-        let bits = chars_to_bits(chars).unwrap();
+        let bits = str_to_bits(s).unwrap();
         let expected = vec![true, false, false, true, false, true, false, true];
         assert_eq!(bits, expected);
+    }
+
+    #[test_case(vec![true, true, false], "110")]
+    #[test_case(vec![true, false, false, true], "1001")]
+    fn test_bits_to_str(bits: Vec<bool>, s: &str) {
+        assert_eq!(bits_to_str(&bits), s);
     }
 
     #[test]
@@ -150,29 +247,56 @@ mod tests {
     #[test_case("00000010", 0b10)]
     #[test_case("00000011", 0b11)]
     fn test_bits_to_byte(s: &str, b: u8) {
-        let bits = chars_to_bits(s.chars()).unwrap();
+        let bits = str_to_bits(s).unwrap();
         let mut bits_arr: [bool; BYTE_SIZE] = [false; BYTE_SIZE];
         bits_arr.copy_from_slice(&bits);
         let byte = bits_to_byte(bits_arr);
         assert_eq!(byte, b);
     }
 
+    #[test_case("00000000", 0b0)]
+    #[test_case("00000001", 0b1)]
+    #[test_case("00000010", 0b10)]
+    #[test_case("00000011", 0b11)]
+    fn test_byte_to_bits(s: &str, b: u8) {
+        let sbits = str_to_bits(s).unwrap();
+        let bbits = byte_to_bits(b);
+
+        assert_eq!(&sbits, &bbits);
+    }
+
     #[test_case("0000000000000000", vec![0b0, 0b0])]
     #[test_case("0000000100000010", vec![0b1, 0b10])]
-    fn test_read_binmsg(s: &str, b: Vec<u8>) {
-        let mut sbytes = s.as_bytes();
-        let msg = BinMsg::read(&mut sbytes).unwrap();
-        assert_eq!(msg.0, b)
+    fn test_read_write_binmsg(s: &str, b: Vec<u8>) {
+        let msg = BinMsg::read(s.as_bytes()).unwrap();
+        assert_eq!(msg.0, b);
+
+        let mut buf = Vec::new();
+        msg.write(&mut buf).unwrap();
+        let sfinal = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s, sfinal);
+    }
+
+    #[test_case("hello")]
+    #[test_case("1 n2 m432,m654"; "arbitrary string")]
+    #[test_case("😂 I'm d"; "with emojis")]
+    #[test_case("終於有了信號 我沒"; "chinese")]
+    fn test_read_write_strmsg(s: &str) {
+        let msg = StrMsg::read(s.as_bytes()).unwrap();
+        assert_eq!(&*msg, s);
+
+        let mut buf = Vec::new();
+        msg.write(&mut buf).unwrap();
+        let sfinal = std::str::from_utf8(&buf).unwrap();
+        assert_eq!(s, sfinal);
     }
 
     #[test_case("01100001", "a")]
     #[test_case("01100010", "b")]
     #[test_case("0110000101100010", "ab")]
-    fn test_smsg_bmsg_conversion(mut b: &str, mut s: &str) {
-        let mut bbytes = b.as_bytes();
-        let mut sbytes = s.as_bytes();
-        let bmsg = BinMsg::read(&mut bbytes).unwrap();
-        let smsg = StrMsg::read(&mut sbytes).unwrap();
+    fn test_smsg_bmsg_conversion(b: &str, s: &str) {
+        let bmsg = BinMsg::read(b.as_bytes()).unwrap();
+        let smsg = StrMsg::read(s.as_bytes()).unwrap();
         assert_eq!(bmsg, smsg.clone().into());
         assert_eq!(bmsg.try_into(), Ok(smsg));
     }
